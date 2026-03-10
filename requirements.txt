@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy
+pillow
+streamlit
+scikit-image
+einops
+tqdm
+# Optional: timm if you use pretrained ViT utilities
+timm
+gdown
