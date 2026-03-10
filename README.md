@@ -291,18 +291,6 @@ Add to Kaggle notebook from:
 }
 ```
 
----
-
-## Course Information
-
-- **Student:** Muneeb
-- **Course:** Generative AI (AI4009)
-- **University:** National University of Computer & Emerging Sciences (NUCES)
-- **Semester:** Spring 2026
-- **Assignment:** No. 2 — Self-Supervised Image Representation Learning
-
----
-
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
@@ -314,6 +302,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 Built with PyTorch & Streamlit | Trained on Kaggle T4 x2 | By **Muneeb**
 
 </div>
-
-
 
