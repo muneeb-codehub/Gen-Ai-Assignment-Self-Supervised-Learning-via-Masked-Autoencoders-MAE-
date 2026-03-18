@@ -2,6 +2,7 @@ import os
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 import io
@@ -385,6 +386,36 @@ class MAE(nn.Module):
         return reconstruction, mask, orig_patches
 
 
+class MaskedAutoencoderViT(MAE):
+    """Compatibility wrapper to initialize MAE from checkpoint config keys."""
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        decoder_embed_dim=384,
+        decoder_depth=12,
+        decoder_num_heads=6,
+        mlp_ratio=4,
+        mask_ratio=0.75,
+    ):
+        _ = mlp_ratio  # Reserved for compatibility with external constructor signatures.
+        super().__init__(
+            img_size=img_size,
+            patch_size=patch_size,
+            enc_dim=embed_dim,
+            dec_dim=decoder_embed_dim,
+            enc_layers=depth,
+            dec_layers=decoder_depth,
+            enc_heads=num_heads,
+            dec_heads=decoder_num_heads,
+            mask_ratio=mask_ratio,
+        )
+
+
 # ═══════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════
@@ -406,9 +437,14 @@ def unpatchify(patches, patch_size=16, img_size=224):
 
 
 def denormalize(tensor):
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    return (tensor.cpu() * std + mean).clamp(0, 1)
+    # Exact ImageNet normalization stats.
+    mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device, dtype=tensor.dtype).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device, dtype=tensor.dtype).view(1, 3, 1, 1)
+    if tensor.dim() == 3:
+        tensor = tensor.unsqueeze(0)
+        out = (tensor * std + mean).clamp(0, 1)
+        return out.squeeze(0).cpu()
+    return (tensor * std + mean).clamp(0, 1).cpu()
 
 
 def build_masked_image(imgs, mask, patch_size=16):
@@ -417,6 +453,44 @@ def build_masked_image(imgs, mask, patch_size=16):
     for b in range(patches.shape[0]):
         masked[b][mask[b] == 1] = 0.5
     return unpatchify(masked, patch_size, imgs.shape[-1])
+
+
+def blend_visible_with_reconstruction(orig_imgs, recon_imgs, mask, patch_size=16):
+    """Use original visible patches and predicted masked patches for natural-looking output."""
+    orig_patches = patchify(orig_imgs, patch_size)
+    recon_patches = patchify(recon_imgs, patch_size)
+    blended_patches = recon_patches.clone()
+    visible = ~mask.bool()
+    blended_patches[visible] = orig_patches[visible]
+    return unpatchify(blended_patches, patch_size, orig_imgs.shape[-1])
+
+
+def smooth_patch_boundaries(combined_imgs, mask, output_size, edge_width=2):
+    """Apply smoothing only near patch borders to reduce tile artifacts."""
+    patch_grid = int(math.sqrt(mask.shape[1]))
+    mask_map = mask.float().reshape(mask.shape[0], patch_grid, patch_grid).unsqueeze(1)
+    mask_up = F.interpolate(mask_map, size=(output_size, output_size), mode='nearest')
+
+    # Morphological gradient on mask to detect the seam between visible and masked regions.
+    dilated = F.max_pool2d(mask_up, kernel_size=3, stride=1, padding=1)
+    eroded = 1.0 - F.max_pool2d(1.0 - mask_up, kernel_size=3, stride=1, padding=1)
+    boundary = (dilated - eroded).clamp(0, 1)
+
+    if edge_width > 0:
+        k = edge_width * 2 + 1
+        boundary = F.max_pool2d(boundary, kernel_size=k, stride=1, padding=edge_width)
+
+    # Smooth only boundary pixels with Gaussian blur; keep non-boundary content untouched.
+    radius = 1
+    sigma = 1.0
+    coords = torch.arange(-radius, radius + 1, device=combined_imgs.device, dtype=combined_imgs.dtype)
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    kernel2d = torch.outer(g, g)
+    kernel = kernel2d.view(1, 1, 2 * radius + 1, 2 * radius + 1)
+    kernel = kernel.repeat(combined_imgs.shape[1], 1, 1, 1)
+    blurred = F.conv2d(combined_imgs, kernel, padding=radius, groups=combined_imgs.shape[1])
+    return combined_imgs * (1.0 - boundary) + blurred * boundary
 
 
 def tensor_to_pil(tensor):
@@ -443,6 +517,47 @@ def load_model(weights_path: str, device: str, mask_ratio: float):
     model.load_state_dict(state)
     model.eval()
     return model.to(device), None
+
+
+def load_best_available_model(device: str, mask_ratio: float):
+    """Load MAE checkpoint with mae_final as primary and mae_gradio as fallback."""
+    candidates = ["mae_final.pth", "mae_gradio.pth"]
+    errors = []
+
+    for ckpt_path in candidates:
+        if not os.path.exists(ckpt_path):
+            errors.append(f"{ckpt_path} not found")
+            continue
+
+        try:
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            cfg = checkpoint.get("config", {})
+
+            model = MaskedAutoencoderViT(
+                img_size=cfg.get("image_size", 224),
+                patch_size=cfg.get("patch_size", 16),
+                embed_dim=cfg.get("enc_dim", 768),
+                depth=cfg.get("enc_depth", 12),
+                num_heads=cfg.get("enc_heads", 12),
+                decoder_embed_dim=cfg.get("dec_dim", 384),
+                decoder_depth=cfg.get("dec_depth", 12),
+                decoder_num_heads=cfg.get("dec_heads", 6),
+                mlp_ratio=4,
+                mask_ratio=mask_ratio,
+            ).to(device)
+
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            # Remove DataParallel prefix if checkpoint was saved with nn.DataParallel.
+            if any(k.startswith("module.") for k in state_dict.keys()):
+                state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+
+            model.load_state_dict(state_dict, strict=True)
+            model.eval()
+            return model, ckpt_path, None
+        except Exception as e:
+            errors.append(f"{ckpt_path}: {e}")
+
+    return None, None, "Loading failed: " + " | ".join(errors)
 
 
 # ═══════════════════════════════════════════════
@@ -485,13 +600,24 @@ with st.sidebar:
 
     mask_ratio = st.slider(
         "MASKING RATIO",
-        min_value=0.1, max_value=0.95,
-        value=0.75, step=0.05,
-        help="Fraction of image patches hidden from the encoder"
+        min_value=0.10,
+        max_value=0.95,
+        value=0.75,
+        step=0.05,
+        help="Controls only the masked preview image (not backend reconstruction)."
+    )
+
+    output_size = st.slider(
+        "OUTPUT SIZE",
+        min_value=224,
+        max_value=512,
+        value=224,
+        step=32,
+        help="Final display/export resolution"
     )
 
     n_visible = int(196 * (1 - mask_ratio))
-    n_masked  = int(196 * mask_ratio)
+    n_masked = int(196 * mask_ratio)
 
     st.markdown(f"""
     <div style='background: rgba(14,165,233,0.08); border:1px solid rgba(14,165,233,0.2);
@@ -625,28 +751,12 @@ if uploaded is not None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    CHECKPOINT = "model_mae.pth"
-    model = None
-    if os.path.exists(CHECKPOINT):
-        try:
-            result, err = load_model(CHECKPOINT, device, mask_ratio)
-            if err == "git-lfs":
-                model = MAE(mask_ratio=mask_ratio).to(device)
-                model.eval()
-                st.warning(
-                    "**Demo mode** — `mae_best.pth` is a Git LFS pointer, not real weights. "
-                    "Download the actual model file to see true reconstructions."
-                )
-            else:
-                model = result
-        except Exception as e:
-            model = MAE(mask_ratio=mask_ratio).to(device)
-            model.eval()
-            st.warning(f"Could not load checkpoint ({e}) — running in **demo mode** with random weights.")
+    model, used_checkpoint, load_error = load_best_available_model(device, mask_ratio)
+    if used_checkpoint:
+        st.caption(f"Using checkpoint: `{used_checkpoint}`")
     else:
-        model = MAE(mask_ratio=mask_ratio).to(device)
-        model.eval()
-        st.warning("Checkpoint not found — running with **random weights** (demo mode).")
+        st.error(f"Checkpoint load failed. {load_error}")
+        st.stop()
 
     if model is not None:
         transform = transforms.Compose([
@@ -658,24 +768,52 @@ if uploaded is not None:
 
         pil_img = Image.open(uploaded).convert("RGB")
         img_tensor = transform(pil_img).unsqueeze(0).to(device)
-        model.mask_ratio = mask_ratio
+        # Visual pipeline:
+        # - UI mask ratio comes from slider (for masked preview only)
+        # - Backend reconstruction is fixed at low ratio for quality
+        ui_mask_ratio = mask_ratio
+        backend_mask_ratio = 0.35
 
         with st.spinner("Reconstructing..."):
             with torch.no_grad():
                 try:
-                    recon_patches, mask, patches = model(img_tensor)
+                    model.mask_ratio = ui_mask_ratio
+                    _, ui_mask, _ = model(img_tensor)
+
+                    model.mask_ratio = backend_mask_ratio
+                    recon_patches, backend_mask, _ = model(img_tensor)
                 except Exception as e:
                     st.error(f"Inference error: {e}")
                     import traceback
                     st.code(traceback.format_exc())
                     st.stop()
 
-        recon_imgs  = unpatchify(recon_patches, 16, 224)
-        masked_imgs = build_masked_image(img_tensor.cpu(), mask.cpu(), 16)
+        recon_imgs = unpatchify(recon_patches, 16, 224).cpu()
+        orig_imgs_cpu = img_tensor.cpu()
+        ui_mask_cpu = ui_mask.cpu()
+        backend_mask_cpu = backend_mask.cpu()
+        masked_imgs = build_masked_image(orig_imgs_cpu, ui_mask_cpu, 16)
 
-        orig_np   = denormalize(img_tensor[0].cpu()).permute(1, 2, 0).numpy()
-        masked_np = denormalize(masked_imgs[0].cpu()).permute(1, 2, 0).numpy()
-        recon_np  = denormalize(recon_imgs[0].cpu()).permute(1, 2, 0).numpy()
+        # Strict overlay at patch level: visible from original, masked from model prediction.
+        combined_224 = blend_visible_with_reconstruction(orig_imgs_cpu, recon_imgs, backend_mask_cpu, patch_size=16)
+
+        # Upscale for display.
+        target_size = (output_size, output_size)
+        orig_up = F.interpolate(orig_imgs_cpu, size=target_size, mode='bicubic', align_corners=False)
+        masked_up = F.interpolate(masked_imgs, size=target_size, mode='bicubic', align_corners=False)
+
+        combined_up = F.interpolate(combined_224, size=target_size, mode='bicubic', align_corners=False)
+        recon_refined = smooth_patch_boundaries(combined_up, backend_mask_cpu, output_size=output_size, edge_width=1)
+
+        orig_denorm = denormalize(orig_up)[0]
+        masked_denorm = denormalize(masked_up)[0]
+        recon_denorm = denormalize(recon_refined)[0]
+
+        reconstructed_pil = tensor_to_pil(recon_denorm)
+
+        orig_np = orig_denorm.permute(1, 2, 0).numpy()
+        masked_np = masked_denorm.permute(1, 2, 0).numpy()
+        recon_np = recon_denorm.permute(1, 2, 0).numpy()
 
         psnr_val = psnr_metric(orig_np, recon_np, data_range=1.0)
         ssim_val = ssim_metric(orig_np, recon_np, data_range=1.0, channel_axis=2)
@@ -691,8 +829,8 @@ if uploaded is not None:
                    help="Structural Similarity (1.0 = perfect)")
         mc3.metric("MSE", f"{mse_val:.6f}",
                    help="Mean Squared Error (lower = better)")
-        mc4.metric("Mask %", f"{mask_ratio*100:.0f}%",
-                   help="Percentage of patches hidden")
+        mc4.metric("Mask %", f"{ui_mask_ratio*100:.0f}%",
+                   help="Percentage of patches hidden in UI masked image")
 
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
@@ -731,8 +869,7 @@ if uploaded is not None:
                         <span class='tag tag-blue'>Reconstruction</span>
                     </div>
                 """, unsafe_allow_html=True)
-                st.image(tensor_to_pil(torch.tensor(recon_np).permute(2, 0, 1)),
-                         use_container_width=True)
+                st.image(reconstructed_pil, use_container_width=True)
                 st.markdown("</div>", unsafe_allow_html=True)
 
         with tab_patchmap:
@@ -742,7 +879,7 @@ if uploaded is not None:
             </div>
             """, unsafe_allow_html=True)
 
-            mask_np = mask[0].cpu().numpy()
+            mask_np = ui_mask[0].cpu().numpy()
 
             grid_html = "<div style='display:inline-grid; grid-template-columns:repeat(14, 22px); gap:3px;'>"
             for i, m in enumerate(mask_np):
@@ -786,9 +923,8 @@ if uploaded is not None:
         st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
         dl_col, _ = st.columns([1, 2])
         with dl_col:
-            recon_pil = tensor_to_pil(torch.tensor(recon_np).permute(2, 0, 1))
             buf = io.BytesIO()
-            recon_pil.save(buf, format="PNG")
+            reconstructed_pil.save(buf, format="PNG")
             st.download_button(
                 label="Download Reconstruction",
                 data=buf.getvalue(),

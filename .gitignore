@@ -1,9 +1,0 @@
-*.pth
-pth/
-.venv/
-venv/
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-
-__pycache__/
