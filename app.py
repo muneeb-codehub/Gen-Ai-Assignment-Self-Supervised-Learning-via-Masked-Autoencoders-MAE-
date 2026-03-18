@@ -604,7 +604,7 @@ with st.sidebar:
         max_value=0.95,
         value=0.75,
         step=0.05,
-        help="Controls only the masked preview image (not backend reconstruction)."
+        help="Controls masking for both preview and reconstruction."
     )
 
     output_size = st.slider(
@@ -768,20 +768,12 @@ if uploaded is not None:
 
         pil_img = Image.open(uploaded).convert("RGB")
         img_tensor = transform(pil_img).unsqueeze(0).to(device)
-        # Visual pipeline:
-        # - UI mask ratio comes from slider (for masked preview only)
-        # - Backend reconstruction is fixed at low ratio for quality
-        ui_mask_ratio = mask_ratio
-        backend_mask_ratio = 0.35
 
         with st.spinner("Reconstructing..."):
             with torch.no_grad():
                 try:
-                    model.mask_ratio = ui_mask_ratio
-                    _, ui_mask, _ = model(img_tensor)
-
-                    model.mask_ratio = backend_mask_ratio
-                    recon_patches, backend_mask, _ = model(img_tensor)
+                    model.mask_ratio = mask_ratio
+                    recon_patches, mask, _ = model(img_tensor)
                 except Exception as e:
                     st.error(f"Inference error: {e}")
                     import traceback
@@ -790,12 +782,11 @@ if uploaded is not None:
 
         recon_imgs = unpatchify(recon_patches, 16, 224).cpu()
         orig_imgs_cpu = img_tensor.cpu()
-        ui_mask_cpu = ui_mask.cpu()
-        backend_mask_cpu = backend_mask.cpu()
-        masked_imgs = build_masked_image(orig_imgs_cpu, ui_mask_cpu, 16)
+        mask_cpu = mask.cpu()
+        masked_imgs = build_masked_image(orig_imgs_cpu, mask_cpu, 16)
 
         # Strict overlay at patch level: visible from original, masked from model prediction.
-        combined_224 = blend_visible_with_reconstruction(orig_imgs_cpu, recon_imgs, backend_mask_cpu, patch_size=16)
+        combined_224 = blend_visible_with_reconstruction(orig_imgs_cpu, recon_imgs, mask_cpu, patch_size=16)
 
         # Upscale for display.
         target_size = (output_size, output_size)
@@ -803,7 +794,7 @@ if uploaded is not None:
         masked_up = F.interpolate(masked_imgs, size=target_size, mode='bicubic', align_corners=False)
 
         combined_up = F.interpolate(combined_224, size=target_size, mode='bicubic', align_corners=False)
-        recon_refined = smooth_patch_boundaries(combined_up, backend_mask_cpu, output_size=output_size, edge_width=1)
+        recon_refined = smooth_patch_boundaries(combined_up, mask_cpu, output_size=output_size, edge_width=1)
 
         orig_denorm = denormalize(orig_up)[0]
         masked_denorm = denormalize(masked_up)[0]
@@ -829,7 +820,7 @@ if uploaded is not None:
                    help="Structural Similarity (1.0 = perfect)")
         mc3.metric("MSE", f"{mse_val:.6f}",
                    help="Mean Squared Error (lower = better)")
-        mc4.metric("Mask %", f"{ui_mask_ratio*100:.0f}%",
+        mc4.metric("Mask %", f"{mask_ratio*100:.0f}%",
                    help="Percentage of patches hidden in UI masked image")
 
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
@@ -879,7 +870,7 @@ if uploaded is not None:
             </div>
             """, unsafe_allow_html=True)
 
-            mask_np = ui_mask[0].cpu().numpy()
+            mask_np = mask[0].cpu().numpy()
 
             grid_html = "<div style='display:inline-grid; grid-template-columns:repeat(14, 22px); gap:3px;'>"
             for i, m in enumerate(mask_np):
