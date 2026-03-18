@@ -278,7 +278,6 @@ Add to Kaggle notebook from:
   author  = {He, Kaiming and Chen, Xinlei and Xie, Saining and
              Li, Yanghao and Dollar, Piotr and Girshick, Ross},
   journal = {arXiv preprint arXiv:2111.06377},
-  year    = {2021}
 }
 
 @article{dosovitskiy2020image,
@@ -287,19 +286,11 @@ Add to Kaggle notebook from:
   author  = {Dosovitskiy, Alexey and Beyer, Lucas and
              Kolesnikov, Alexander and others},
   journal = {arXiv preprint arXiv:2010.11929},
-  year    = {2020}
 }
 ```
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
----
 
 <div align="center">
 
 Built with PyTorch & Streamlit | Trained on Kaggle T4 x2 | By **Muneeb**
 
 </div>
-
